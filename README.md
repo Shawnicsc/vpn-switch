@@ -47,6 +47,12 @@ proxy, and you can switch each provider independently.
 omarchy plugin add https://github.com/Shawnicsc/vpn-switch.git --enable
 ```
 
+If your network has trouble with HTTPS Git, use the SSH URL instead:
+
+```bash
+omarchy plugin add git@github.com:Shawnicsc/vpn-switch.git --enable
+```
+
 This installs the widget as `io.github.shawnicsc.vpn` and places it in the
 right bar section by default. The bundled CLI is invoked by the widget, so no
 extra setup is needed. Add menu rows or a global `vpn-switch` command only if
