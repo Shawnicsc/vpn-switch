@@ -1,0 +1,830 @@
+#!/usr/bin/env bash
+# vpn-switch — 管理本机 VPN / 代理，可同时开启互不冲突的组合
+#
+# 用法:
+#   vpn-switch panel              # 给状态栏浮层用的 JSON（自动发现本机 VPN）
+#   vpn-switch bar                # Waybar 风格 JSON
+#   vpn-switch status             # 当前已连接的 id（空格分隔，全部断开时输出 off）
+#   vpn-switch list               # 已发现的本机 VPN / 代理（TSV）
+#   vpn-switch on <id>            # 打开一个；与已连接项冲突时拒绝
+#   vpn-switch toggle <id>        # 打开 / 关闭一个
+#   vpn-switch off [id]           # 关一个；不给 id 就全部断开
+#   vpn-switch set <id>           # 独占模式：关掉其它所有，只留目标（兼容旧用法）
+#   vpn-switch cycle              # 独占模式下轮换
+#   vpn-switch refresh            # 立即重新扫描本机 VPN / 代理
+#   vpn-switch has <id>           # 是否安装了该 VPN（菜单 when 用）
+#   vpn-switch is-on <id>         # 是否正在运行（菜单 checked 用）
+#   vpn-switch any-on             # 是否有任意一个在运行
+#
+# 设计:
+#   * 每个 provider 独立开关。overlay（Tailscale 普通模式）可以和任何东西共存；
+#     tunnel 与 tunnel、proxy 与 proxy 会互相打架；tunnel + proxy 允许共存。
+#     mode 为 unknown 的自动发现项按保守方式处理。
+#   * 已安装的软件来自两层发现：
+#       1) 内置的常见 VPN / 代理清单，按可执行文件实时探测；
+#       2) 扫描 .desktop 文件里的 VPN/proxy 关键词，自动纳入新装软件。
+#     每次探测都是实时的，卸载后下次扫描就会消失。结果缓存 30 秒。
+#   * 状态栏图标使用 Nerd Font（Material Design Icons）盾牌，见 glyph()。
+
+set -uo pipefail
+
+VPN_SWITCH_VERSION="1.0.0"
+
+UNIVPN_DIR=/usr/local/UniVPN
+NOTIFY=omarchy-notification-send
+
+STATE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/vpn-switch
+STATE_FILE=$STATE_DIR/state.json
+CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/vpn-switch
+DISCOVERY_FILE=$CACHE_DIR/providers.json
+DISCOVERY_TTL=${VPN_SWITCH_DISCOVERY_TTL:-30}
+
+BUILTIN_IDS=(
+  univpn tailscale flclash clash-verge mihomo sing-box hiddify nekoray
+  mullvad nordvpn protonvpn wireguard openvpn openconnect v2raya
+)
+
+TS_JSON=""
+
+# ---------- 小工具 ----------
+notify() {
+  local headline=${1:-VPN} body=${2:-}
+  if [[ -n $body ]]; then
+    "$NOTIFY" "$headline" "$body" >/dev/null 2>&1 || notify-send "$headline" "$body" >/dev/null 2>&1 || true
+  else
+    "$NOTIFY" "$headline" >/dev/null 2>&1 || notify-send "$headline" >/dev/null 2>&1 || true
+  fi
+}
+
+any_pgrep() {
+  local p
+  for p in "$@"; do pgrep -x "$p" >/dev/null 2>&1 && return 0; done
+  return 1
+}
+
+any_cmd() {
+  local c
+  for c in "$@"; do command -v "$c" >/dev/null 2>&1 && return 0; done
+  return 1
+}
+
+iface_exists() { ip -br link show "$1" >/dev/null 2>&1; }
+
+label() {
+  case $1 in
+    univpn)     printf 'UniVPN 校内' ;;
+    tailscale)  printf 'Tailscale' ;;
+    flclash)    printf 'FlClash' ;;
+    clash-verge) printf 'Clash Verge' ;;
+    mihomo)     printf 'Mihomo' ;;
+    sing-box)   printf 'sing-box' ;;
+    hiddify)    printf 'Hiddify' ;;
+    nekoray)    printf 'NekoRay / NekoBox' ;;
+    mullvad)    printf 'Mullvad' ;;
+    nordvpn)    printf 'NordVPN' ;;
+    protonvpn)  printf 'Proton VPN' ;;
+    wireguard)  printf 'WireGuard' ;;
+    openvpn)    printf 'OpenVPN' ;;
+    openconnect) printf 'OpenConnect' ;;
+    v2raya)     printf 'v2rayA' ;;
+    auto-*)     auto_field "$1" label ;;
+    *)          printf '%s' "$1" ;;
+  esac
+}
+
+hint() {
+  case $1 in
+    univpn)     printf '校内网关' ;;
+    tailscale)  printf 'tailnet / overlay' ;;
+    flclash)    printf '系统代理 / TUN' ;;
+    clash-verge) printf '系统代理 / TUN' ;;
+    mihomo)     printf '代理内核' ;;
+    sing-box)   printf '代理内核' ;;
+    hiddify)    printf '代理 / TUN' ;;
+    nekoray)    printf '代理 / TUN' ;;
+    mullvad)    printf 'WireGuard 隧道' ;;
+    nordvpn)    printf 'VPN 隧道' ;;
+    protonvpn)  printf 'VPN 隧道' ;;
+    wireguard)  printf '隧道（需手动）' ;;
+    openvpn)    printf '隧道（需手动）' ;;
+    openconnect) printf '隧道（需手动）' ;;
+    v2raya)     printf '代理（需手动）' ;;
+    auto-*)     printf '自动发现' ;;
+    *)          printf '' ;;
+  esac
+}
+
+# 状态栏图标：与 ~/.config/omarchy/bar/modules/vpn.qml 保持一致
+# （Nerd Font / MDI 盾牌：连着实心 + 对勾，断开空心）
+glyph() {
+  case "$1" in
+    off) printf '\U000f0499' ;;
+    *)   printf '\U000f0565' ;;
+  esac
+}
+
+remember() {
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  local active changed
+  active=$(status_json_array)
+  changed=$(date +%s)
+  jq -nc --argjson active "$active" --argjson changed "$changed" \
+    '{current:(if ($active|length)>0 then $active[0] else "off" end), active:$active, changedAt:$changed}' \
+    > "$STATE_FILE" 2>/dev/null || true
+}
+
+last_change() {
+  local t
+  t=$(jq -r '.changedAt // 0' "$STATE_FILE" 2>/dev/null)
+  [[ $t =~ ^[0-9]+$ ]] && printf '%s' "$t" || printf '0'
+}
+
+# ---------- Tailscale ----------
+ts_json() {
+  if [[ -z $TS_JSON ]]; then
+    TS_JSON=$(tailscale status --json 2>/dev/null)
+  fi
+  printf '%s' "$TS_JSON"
+}
+
+ts_running()  { [[ $(ts_json | jq -r '.BackendState // empty' 2>/dev/null) == Running ]]; }
+ts_use_exit() { [[ $(ts_json | jq -r '.Self.ExitNode // false' 2>/dev/null) == true ]]; }
+
+# ---------- Clash 系 TUN 探测 ----------
+flclash_tun_enabled() {
+  local f="$HOME/.local/share/com.follow.clash/config.yaml"
+  [[ -f $f ]] || return 1
+  sed -n '/^tun:/,/^[^[:space:]]/p' "$f" 2>/dev/null | grep -Eq '^[[:space:]]*enable:[[:space:]]*true'
+}
+
+clash_verge_tun_enabled() {
+  local f="$HOME/.config/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml"
+  [[ -f $f ]] && grep -Eq '^[[:space:]]*enable_tun_mode:[[:space:]]*true' "$f"
+}
+
+clash_config_tun_enabled() {
+  local f
+  for f in "$HOME/.config/mihomo/config.yaml" "$HOME/.config/clash/config.yaml" \
+           /etc/mihomo/config.yaml /etc/clash/config.yaml; do
+    [[ -f $f ]] || continue
+    sed -n '/^tun:/,/^[^[:space:]]/p' "$f" 2>/dev/null | grep -Eq '^[[:space:]]*enable:[[:space:]]*true' && return 0
+  done
+  return 1
+}
+
+singbox_tun_enabled() {
+  local f
+  for f in "$HOME/.config/sing-box/config.json" /etc/sing-box/config.json; do
+    [[ -f $f ]] || continue
+    jq -e '.inbounds[]? | select(.type=="tun")' "$f" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+# ---------- 自动发现：桌面文件 ----------
+auto_field() {   # auto_field <id> <field>
+  local id=$1 field=$2
+  [[ -s $DISCOVERY_FILE ]] || return 1
+  jq -r --arg id "$id" --arg f "$field" '.[] | select(.id==$id) | .[$f] // empty' \
+    "$DISCOVERY_FILE" 2>/dev/null | head -n1
+}
+
+exec_first_token() {
+  local line=$1 tok
+  local -a toks
+  read -ra toks <<< "$line"
+  for tok in "${toks[@]}"; do
+    tok=${tok%\"}; tok=${tok#\"}; tok=${tok%\'}; tok=${tok#\'}
+    [[ $tok == %* ]] && continue
+    [[ $tok == *=* && $tok != /* ]] && continue          # env VAR=... 前缀
+    [[ $tok == env || $tok == -u || $tok == -- ]] && continue
+    printf '%s' "$tok"
+    return 0
+  done
+  return 1
+}
+
+scan_desktops() {
+  # 输出 TSV: id, label, hint, mode, desktop-file, exec, proc
+  local f name blob exec_line exe proc slug mode
+  local -A seen=()
+  local known_tokens=" UniVPN tailscale flclash FlClash clash-verge verge-mihomo mihomo sing-box hiddify Hiddify hiddify-core nekoray nekobox NekoBox wg-quick openvpn openconnect mullvad nordvpn protonvpn v2raya "
+
+  while IFS= read -r -d '' f; do
+    [[ -f $f ]] || continue
+    grep -Eqi '^NoDisplay[[:space:]]*=[[:space:]]*true' "$f" && continue
+    grep -Eqi '^Hidden[[:space:]]*=[[:space:]]*true' "$f" && continue
+
+    blob=$(grep -E '^(Name|GenericName|Comment|Keywords|Categories)=' "$f" 2>/dev/null | cut -d= -f2- | tr '\n' ' ')
+    grep -Eiq '(^|[;[:space:]])(vpn|proxy|clash|mihomo|v2ray|sing-box|shadowsocks|trojan|hiddify|nekoray|nekobox|wireguard|openvpn|openconnect|tailscale|zerotier|tun2socks)([;[:space:]]|$)' <<< "$blob" || continue
+
+    # 自动发现项按名字粗略判断模式：代理类与隧道类分开
+    if grep -Eiq 'clash|mihomo|v2ray|sing-box|shadowsocks|trojan|proxy' <<< "$blob"; then
+      mode=proxy
+    elif grep -Eiq 'vpn|wireguard|openvpn|openconnect|tailscale|zerotier|tunnel' <<< "$blob"; then
+      mode=tunnel
+    else
+      mode=unknown
+    fi
+
+    name=$(grep -m1 '^Name=' "$f" 2>/dev/null | cut -d= -f2-)
+    [[ -n $name ]] || name=$(basename "$f" .desktop)
+    exec_line=$(grep -m1 '^Exec=' "$f" 2>/dev/null | cut -d= -f2-)
+    [[ -n $exec_line ]] || continue
+    exe=$(exec_first_token "$exec_line") || continue
+    [[ -n $exe ]] || continue
+
+    if [[ $exe == /* ]]; then
+      [[ -x $exe ]] || continue
+      proc=$(basename "$exe")
+    else
+      command -v "$exe" >/dev/null 2>&1 || continue
+      proc=$(basename "$exe")
+    fi
+    [[ -n $proc ]] || continue
+    case $known_tokens in *" $proc "*) continue ;; esac
+    # flatpak / shell 包装的 Exec 无法可靠判定进程，交给内置清单或手动处理
+    case $proc in flatpak|sh|bash|env|dash) continue ;; esac
+    [[ -n ${seen[$proc]:-} ]] && continue
+    seen[$proc]=1
+
+    slug=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//; s/-$//')
+    [[ -n $slug ]] || slug=$proc
+    printf 'auto-%s\t%s\t自动发现\t%s\t%s\t%s\t%s\n' "$slug" "$name" "$mode" "$f" "$exe" "$proc"
+  done < <(
+    for d in /usr/share/applications "$HOME/.local/share/applications" \
+             "$HOME/.local/share/flatpak/exports/share/applications" \
+             /var/lib/flatpak/exports/share/applications; do
+      [[ -d $d ]] || continue
+      find "$d" -maxdepth 1 -type f -name '*.desktop' -print0 2>/dev/null
+    done | sort -z
+  )
+}
+
+# ---------- provider 属性 ----------
+p_avail() {
+  local id=$1
+  case $id in
+    univpn)      [[ -x $UNIVPN_DIR/UniVPN ]] ;;
+    tailscale)   command -v tailscale >/dev/null 2>&1 ;;
+    flclash)     command -v flclash >/dev/null 2>&1 || [[ -x /usr/lib/flclash/FlClash ]] ;;
+    clash-verge) command -v clash-verge >/dev/null 2>&1 || [[ -x /usr/bin/clash-verge ]] ;;
+    mihomo)      command -v mihomo >/dev/null 2>&1 ;;
+    sing-box)    command -v sing-box >/dev/null 2>&1 ;;
+    hiddify)     any_cmd hiddify Hiddify hiddify-core ;;
+    nekoray)     any_cmd nekoray nekobox NekoBox ;;
+    mullvad)     command -v mullvad >/dev/null 2>&1 ;;
+    nordvpn)     command -v nordvpn >/dev/null 2>&1 ;;
+    protonvpn)   any_cmd protonvpn protonvpn-cli ;;
+    wireguard)   command -v wg-quick >/dev/null 2>&1 ;;
+    openvpn)     command -v openvpn >/dev/null 2>&1 ;;
+    openconnect) command -v openconnect >/dev/null 2>&1 ;;
+    v2raya)      command -v v2raya >/dev/null 2>&1 ;;
+    auto-*)
+      [[ -s $DISCOVERY_FILE ]] || return 1
+      jq -e --arg id "$id" '.[] | select(.id==$id)' "$DISCOVERY_FILE" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+p_on() {
+  local id=$1
+  case $id in
+    univpn)      iface_exists cnem_vnic || pgrep -x UniVPN >/dev/null 2>&1 ;;
+    tailscale)   ts_running ;;
+    flclash)     any_pgrep FlClash FlClashCore ;;
+    clash-verge) any_pgrep clash-verge verge-mihomo ;;
+    mihomo)      pgrep -x mihomo >/dev/null 2>&1 ;;
+    sing-box)    pgrep -x sing-box >/dev/null 2>&1 ;;
+    hiddify)     any_pgrep hiddify Hiddify hiddify-core ;;
+    nekoray)     any_pgrep nekoray nekobox NekoBox ;;
+    mullvad)     mullvad status -j 2>/dev/null | jq -e '.state == "connected"' >/dev/null 2>&1 ;;
+    nordvpn)     nordvpn status 2>/dev/null | grep -q 'Status: Connected' ;;
+    protonvpn)   pgrep -f -- '(^|/)protonvpn([[:space:]]|$)' >/dev/null 2>&1 ;;
+    wireguard)   ip -o link show type wireguard 2>/dev/null | grep -q . ;;
+    openvpn)     pgrep -x openvpn >/dev/null 2>&1 ;;
+    openconnect) pgrep -x openconnect >/dev/null 2>&1 ;;
+    v2raya)      any_pgrep v2raya v2raya-core ;;
+    auto-*)
+      local proc exe abs
+      proc=$(auto_field "$id" proc)
+      [[ -n $proc ]] || return 1
+      pgrep -x "$proc" >/dev/null 2>&1 && return 0
+      # 只按可执行文件的绝对路径匹配命令行，避免 pgrep -f 误伤同名参数
+      exe=$(auto_field "$id" exe)
+      [[ -n $exe ]] || return 1
+      if [[ $exe == /* ]]; then abs=$exe; else abs=$(command -v "$exe" 2>/dev/null); fi
+      [[ -n $abs ]] && pgrep -f -- "^${abs}([[:space:]]|$)" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+p_mode() {
+  local id=$1
+  case $id in
+    univpn)      printf 'tunnel' ;;
+    tailscale)   if ts_use_exit; then printf 'tunnel'; else printf 'overlay'; fi ;;
+    flclash)     if flclash_tun_enabled || iface_exists FlClash; then printf 'tunnel'; else printf 'proxy'; fi ;;
+    clash-verge) if clash_verge_tun_enabled || iface_exists Mihomo || iface_exists utun; then printf 'tunnel'; else printf 'proxy'; fi ;;
+    mihomo)      if clash_config_tun_enabled || iface_exists Mihomo || iface_exists mihomo; then printf 'tunnel'; else printf 'proxy'; fi ;;
+    sing-box)    if singbox_tun_enabled || iface_exists sing-box || iface_exists tun0; then printf 'tunnel'; else printf 'proxy'; fi ;;
+    hiddify|nekoray) printf 'tunnel' ;;
+    mullvad|nordvpn|protonvpn|wireguard|openvpn|openconnect) printf 'tunnel' ;;
+    v2raya)      printf 'proxy' ;;
+    auto-*)      local m; m=$(auto_field "$id" mode); printf '%s' "${m:-unknown}" ;;
+    *)           printf 'unknown' ;;
+  esac
+}
+
+p_manageable() {
+  case $1 in
+    wireguard|openvpn|openconnect|v2raya) return 1 ;;
+    auto-*) return 0 ;;
+    *) return 0 ;;
+  esac
+}
+
+# ---------- 启停 ----------
+stop_univpn() {
+  pkill -x UniVPN >/dev/null 2>&1
+  for _ in $(seq 1 20); do
+    iface_exists cnem_vnic || return 0
+    sleep 0.15
+  done
+  # GUI 已经不在、隧道却还挂着 → 让 CSDK 自己收尾（SIGTERM 它会恢复路由）
+  pkill -x UniVPNCS >/dev/null 2>&1
+  for _ in $(seq 1 20); do
+    iface_exists cnem_vnic || return 0
+    sleep 0.15
+  done
+  return 0
+}
+
+start_univpn() {
+  if [[ ! -x $UNIVPN_DIR/UniVPN ]]; then
+    notify "VPN" "UniVPN 未安装: $UNIVPN_DIR/UniVPN 不存在"
+    return 1
+  fi
+  ( cd "$UNIVPN_DIR" && \
+    LD_LIBRARY_PATH="$UNIVPN_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    QT_QPA_PLATFORM=xcb \
+    setsid ./UniVPN >/dev/null 2>&1 & )
+}
+
+wait_off() {   # wait_off <id> [tries]
+  local tries=${2:-10}
+  for _ in $(seq 1 "$tries"); do
+    p_on "$1" || return 0
+    sleep 0.15
+  done
+  return 1
+}
+
+stop_flclash() {
+  pkill -TERM -x FlClash >/dev/null 2>&1
+  wait_off flclash 12 && return 0
+  pkill -TERM -x FlClashCore >/dev/null 2>&1
+  wait_off flclash 8
+}
+
+stop_clash_verge() {
+  pkill -TERM -x clash-verge >/dev/null 2>&1
+  wait_off clash-verge 10 && return 0
+  pkill -TERM -x verge-mihomo >/dev/null 2>&1
+  wait_off clash-verge 8
+}
+
+first_cmd() {
+  local c
+  for c in "$@"; do command -v "$c" >/dev/null 2>&1 && { printf '%s' "$c"; return 0; }; done
+  return 1
+}
+
+p_start() {
+  local id=$1 bin dir cfg
+  if [[ $id == auto-* ]]; then
+    local desktop
+    desktop=$(auto_field "$id" desktop)
+    [[ -n $desktop ]] || return 1
+    setsid gio launch "$desktop" >/dev/null 2>&1 &
+    return 0
+  fi
+  case $id in
+    univpn)   start_univpn ;;
+    tailscale) tailscale up >/dev/null 2>&1 ;;
+    flclash)
+      if command -v flclash >/dev/null 2>&1; then setsid flclash >/dev/null 2>&1 &
+      else setsid /usr/lib/flclash/FlClash >/dev/null 2>&1 & fi ;;
+    clash-verge) setsid clash-verge >/dev/null 2>&1 & ;;
+    mihomo)
+      dir=""
+      for d in "$HOME/.config/mihomo" "$HOME/.config/clash" /etc/mihomo /etc/clash; do
+        [[ -d $d ]] && { dir=$d; break; }
+      done
+      [[ -n $dir ]] || return 1
+      setsid mihomo -d "$dir" >/dev/null 2>&1 & ;;
+    sing-box)
+      cfg=""
+      for f in "$HOME/.config/sing-box/config.json" /etc/sing-box/config.json; do
+        [[ -f $f ]] && { cfg=$f; break; }
+      done
+      [[ -n $cfg ]] || return 1
+      setsid sing-box run -c "$cfg" >/dev/null 2>&1 & ;;
+    hiddify)
+      bin=$(first_cmd hiddify Hiddify hiddify-core) || return 1
+      setsid "$bin" >/dev/null 2>&1 & ;;
+    nekoray)
+      bin=$(first_cmd nekoray nekobox NekoBox) || return 1
+      setsid "$bin" >/dev/null 2>&1 & ;;
+    mullvad)  mullvad connect >/dev/null 2>&1 ;;
+    nordvpn)  nordvpn connect >/dev/null 2>&1 ;;
+    protonvpn)
+      if command -v protonvpn >/dev/null 2>&1; then protonvpn connect >/dev/null 2>&1
+      else protonvpn-cli connect >/dev/null 2>&1; fi ;;
+    *) return 1 ;;
+  esac
+}
+
+p_stop() {
+  local id=$1 proc
+  if [[ $id == auto-* ]]; then
+    local exe abs
+    proc=$(auto_field "$id" proc)
+    exe=$(auto_field "$id" exe)
+    [[ -n $proc ]] || return 0
+    pkill -TERM -x "$proc" >/dev/null 2>&1
+    if [[ -n $exe ]]; then
+      if [[ $exe == /* ]]; then abs=$exe; else abs=$(command -v "$exe" 2>/dev/null); fi
+      [[ -n $abs ]] && pkill -TERM -f -- "^${abs}([[:space:]]|$)" >/dev/null 2>&1
+    fi
+    wait_off "$id" 8
+    return $?
+  fi
+  case $id in
+    univpn)      stop_univpn ;;
+    tailscale)   tailscale down >/dev/null 2>&1 ;;
+    flclash)     stop_flclash ;;
+    clash-verge) stop_clash_verge ;;
+    mihomo)      pkill -TERM -x mihomo >/dev/null 2>&1 ;;
+    sing-box)    pkill -TERM -x sing-box >/dev/null 2>&1 ;;
+    hiddify)     pkill -TERM -x hiddify >/dev/null 2>&1; pkill -TERM -x Hiddify >/dev/null 2>&1; pkill -TERM -x hiddify-core >/dev/null 2>&1 ;;
+    nekoray)     pkill -TERM -x nekoray >/dev/null 2>&1; pkill -TERM -x nekobox >/dev/null 2>&1; pkill -TERM -x NekoBox >/dev/null 2>&1 ;;
+    mullvad)     mullvad disconnect >/dev/null 2>&1 ;;
+    nordvpn)     nordvpn disconnect >/dev/null 2>&1 ;;
+    protonvpn)
+      if command -v protonvpn >/dev/null 2>&1; then protonvpn disconnect >/dev/null 2>&1
+      else protonvpn-cli disconnect >/dev/null 2>&1; fi ;;
+    openvpn)     pkill -TERM -x openvpn >/dev/null 2>&1 ;;
+    openconnect) pkill -TERM -x openconnect >/dev/null 2>&1 ;;
+    v2raya)      pkill -TERM -x v2raya >/dev/null 2>&1; pkill -TERM -x v2raya-core >/dev/null 2>&1 ;;
+    wireguard)   return 1 ;;
+    *)           return 1 ;;
+  esac
+}
+
+# ---------- 发现缓存 ----------
+build_discovery() {
+  local tmp="$DISCOVERY_FILE.tmp.$$" rows=() id mode
+  mkdir -p "$CACHE_DIR" 2>/dev/null
+  for id in "${BUILTIN_IDS[@]}"; do
+    p_avail "$id" || continue
+    mode=$(p_mode "$id")
+    rows+=("$(jq -nc --arg id "$id" --arg label "$(label "$id")" --arg hint "$(hint "$id")" \
+      --arg mode "$mode" --arg kind builtin \
+      '{id:$id,label:$label,hint:$hint,mode:$mode,kind:$kind}')")
+  done
+  while IFS=$'\t' read -r id label hint mode desktop exe proc; do
+    [[ -n $id ]] || continue
+    rows+=("$(jq -nc --arg id "$id" --arg label "$label" --arg hint "$hint" \
+      --arg mode "$mode" --arg desktop "$desktop" --arg exe "$exe" --arg proc "$proc" \
+      '{id:$id,label:$label,hint:$hint,mode:$mode,kind:"desktop",desktop:$desktop,exe:$exe,proc:$proc}')")
+  done < <(scan_desktops)
+  printf '%s\n' "${rows[@]}" | jq -s '.' > "$tmp" 2>/dev/null && mv "$tmp" "$DISCOVERY_FILE"
+  rm -f "$tmp" 2>/dev/null
+}
+
+ensure_discovery() {
+  mkdir -p "$CACHE_DIR" 2>/dev/null
+  local now mtime
+  if [[ -s $DISCOVERY_FILE ]]; then
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$DISCOVERY_FILE" 2>/dev/null || printf '0')
+    (( now - mtime < DISCOVERY_TTL )) && return 0
+  fi
+  build_discovery
+}
+
+all_ids() {
+  ensure_discovery
+  jq -r '.[].id' "$DISCOVERY_FILE" 2>/dev/null
+}
+
+# ---------- 冲突 ----------
+conflict_between() {   # conflict_between <mode-a> <mode-b>
+  local a=$1 b=$2
+  [[ $a == overlay || $b == overlay ]] && return 1
+  [[ $a == unknown || $b == unknown ]] && return 0
+  [[ $a == "$b" ]] && return 0
+  return 1   # tunnel + proxy 允许共存
+}
+
+conflict_ids() {   # 当前已连接、且与 <id> 冲突的 provider
+  ensure_discovery
+  local id=$1 mode other omode
+  mode=$(p_mode "$id")
+  while IFS= read -r other; do
+    [[ -n $other && $other != "$id" ]] || continue
+    p_on "$other" || continue
+    omode=$(p_mode "$other")
+    conflict_between "$mode" "$omode" && printf '%s\n' "$other"
+  done < <(all_ids)
+}
+
+status_json_array() {
+  ensure_discovery
+  local ids=() b id
+  while IFS= read -r b; do
+    id=$(printf '%s' "$b" | base64 -d 2>/dev/null | jq -r '.id // empty' 2>/dev/null)
+    [[ -n $id ]] || continue
+    p_on "$id" && ids+=("$id")
+  done < <(jq -r '.[] | @base64' "$DISCOVERY_FILE" 2>/dev/null)
+  if (( ${#ids[@]} == 0 )); then
+    printf '[]'
+  else
+    printf '%s\n' "${ids[@]}" | jq -R . | jq -s .
+  fi
+}
+
+# ---------- 动作 ----------
+on_provider() {
+  local id=${1:-} force=${2:-0}
+  if [[ -z $id ]]; then echo "usage: vpn-switch on <id>" >&2; return 2; fi
+  if ! p_avail "$id"; then
+    notify "VPN" "$(label "$id") 未安装或已卸载"
+    return 1
+  fi
+
+  local conflicts=() c names=()
+  while IFS= read -r c; do [[ -n $c ]] && conflicts+=("$c"); done < <(conflict_ids "$id")
+  if (( ${#conflicts[@]} > 0 )); then
+    if (( force )); then
+      for c in "${conflicts[@]}"; do
+        p_stop "$c" >/dev/null 2>&1
+        names+=("$(label "$c")")
+      done
+      sleep 0.5
+      notify "VPN" "已断开冲突项：${names[*]}"
+    else
+      for c in "${conflicts[@]}"; do names+=("$(label "$c")"); done
+      notify "VPN 冲突" "$(label "$id") 与 ${names[*]} 的路由/代理模式冲突，未开启。先关闭冲突项。"
+      return 3
+    fi
+  fi
+
+  if p_on "$id"; then
+    notify "VPN" "$(label "$id") 已在运行"
+    remember
+    return 0
+  fi
+  if ! p_manageable "$id"; then
+    notify "VPN" "$(label "$id") 需要手动启动（本工具只负责检测/关闭）"
+    return 4
+  fi
+  if ! p_start "$id"; then
+    notify "VPN" "$(label "$id") 启动失败"
+    return 1
+  fi
+  for _ in $(seq 1 20); do p_on "$id" && break; sleep 0.15; done
+  if p_on "$id"; then
+    notify "VPN" "$(label "$id") 已开启"
+  else
+    notify "VPN" "$(label "$id") 启动中（需要的话在窗口里完成连接）"
+  fi
+  remember
+}
+
+off_provider() {
+  local id=${1:-} rc
+  if [[ -z $id ]]; then all_off; return; fi
+  if ! p_on "$id"; then
+    notify "VPN" "$(label "$id") 本来就没在运行"
+    remember
+    return 0
+  fi
+  p_stop "$id"
+  rc=$?
+  if (( rc == 0 )); then
+    notify "VPN" "$(label "$id") 已关闭"
+  else
+    notify "VPN" "$(label "$id") 部分进程仍在（可能需要在其界面里退出，或内核为 root 权限）"
+  fi
+  remember
+}
+
+all_off() {
+  local id
+  ensure_discovery
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    p_on "$id" && p_stop "$id" >/dev/null 2>&1
+  done < <(all_ids)
+  notify "VPN" "全部断开"
+  remember
+}
+
+set_vpn() {   # 独占模式
+  local want=${1:-}
+  if [[ -z $want ]]; then echo "usage: vpn-switch set <id>" >&2; return 2; fi
+  ensure_discovery
+  local id
+  while IFS= read -r id; do
+    [[ $id == "$want" ]] && continue
+    p_on "$id" && p_stop "$id" >/dev/null 2>&1
+  done < <(all_ids)
+  if [[ $want == off ]]; then
+    notify "VPN" "全部断开"
+    remember
+    return 0
+  fi
+  on_provider "$want" 1
+}
+
+cycle() {
+  ensure_discovery
+  local ids=() active=() id target next_index idx
+  mapfile -t ids < <(all_ids)
+  (( ${#ids[@]} > 0 )) || { notify "VPN" "没有发现可用的 VPN / 代理"; return 1; }
+  while IFS= read -r id; do
+    [[ -n $id ]] && active+=("$id")
+  done < <(status_json_array | jq -r '.[]')
+
+  if (( ${#active[@]} == 0 )); then
+    target=${ids[0]}
+  elif (( ${#active[@]} > 1 )); then
+    target=off
+  else
+    next_index=0
+    for idx in "${!ids[@]}"; do
+      if [[ ${ids[$idx]} == "${active[0]}" ]]; then
+        next_index=$(( (idx + 1) % ${#ids[@]} ))
+        break
+      fi
+    done
+    target=${ids[$next_index]}
+  fi
+  if [[ $target == off ]]; then
+    all_off
+  else
+    set_vpn "$target"
+  fi
+}
+
+# ---------- 输出 ----------
+panel_json() {
+  ensure_discovery
+  local changed rows=() b row id on mode manageable
+  changed=$(last_change)
+  while IFS= read -r b; do
+    row=$(printf '%s' "$b" | base64 -d 2>/dev/null) || continue
+    [[ -n $row ]] || continue
+    id=$(jq -r '.id // empty' <<< "$row")
+    [[ -n $id ]] || continue
+    p_on "$id" && on=true || on=false
+    mode=$(p_mode "$id")
+    manageable=true; p_manageable "$id" || manageable=false
+    rows+=("$(jq -nc --arg id "$id" \
+      --arg label "$(jq -r '.label // .id' <<< "$row")" \
+      --arg hint "$(jq -r '.hint // empty' <<< "$row")" \
+      --arg mode "$mode" --argjson on "$on" --argjson manageable "$manageable" \
+      --arg kind "$(jq -r '.kind // "builtin"' <<< "$row")" \
+      '{id:$id,label:$label,hint:$hint,mode:$mode,on:$on,manageable:$manageable,kind:$kind}')")
+  done < <(jq -r '.[] | @base64' "$DISCOVERY_FILE" 2>/dev/null)
+
+  if (( ${#rows[@]} == 0 )); then
+    jq -nc --argjson changed "$changed" '{current:"off",active:[],changedAt:$changed,providers:[]}'
+    return
+  fi
+  printf '%s\n' "${rows[@]}" | jq -s --argjson changed "$changed" '
+    def conflict($a; $b):
+      if $a == "overlay" or $b == "overlay" then false
+      elif $a == "unknown" or $b == "unknown" then true
+      elif $a == $b then true
+      else false end;
+    . as $all
+    | ($all | map(select(.on))) as $active
+    | { current: (if ($active|length)>0 then $active[0].id else "off" end),
+        active: [$active[].id],
+        changedAt: $changed,
+        providers: [ $all[] | . as $p | . + {
+          conflicts: [ $all[] | select(.id != $p.id and .on and conflict($p.mode; .mode)) | .label ]
+        } ] }'
+}
+
+bar_json() {
+  ensure_discovery
+  local active count text tooltip
+  active=$(status_json_array)
+  count=$(jq 'length' <<< "$active")
+  local active_labels="" id
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    [[ -n $active_labels ]] && active_labels+=" + "
+    active_labels+=$(label "$id")
+  done < <(jq -r '.[]' <<< "$active")
+  if (( count == 0 )); then
+    text=$(glyph off)
+    tooltip="VPN: 全部断开 · 左键打开面板"
+  else
+    text=$(glyph on)
+    (( count > 1 )) && text+=" +$((count - 1))"
+    tooltip="VPN: $active_labels · 左键打开面板"
+  fi
+  jq -nc --arg text "$text" --arg tooltip "$tooltip" --arg class "$( ((count>0)) && echo active || echo inactive )" \
+    '{text:$text,tooltip:$tooltip,class:$class}'
+}
+
+status_text() {
+  local active
+  active=$(status_json_array)
+  if [[ $(jq 'length' <<< "$active") == 0 ]]; then
+    printf 'off\n'
+  else
+    jq -r 'join(" ")' <<< "$active"
+  fi
+}
+
+list_text() {
+  ensure_discovery
+  local b row id on mode
+  while IFS= read -r b; do
+    row=$(printf '%s' "$b" | base64 -d 2>/dev/null) || continue
+    id=$(jq -r '.id' <<< "$row")
+    p_on "$id" && on=on || on=off
+    mode=$(p_mode "$id")
+    printf '%s\t%s\t%s\t%s\n' "$id" "$(jq -r '.label' <<< "$row")" "$mode" "$on"
+  done < <(jq -r '.[] | @base64' "$DISCOVERY_FILE" 2>/dev/null)
+}
+
+has_provider() {
+  local id=${1:-}
+  [[ -n $id ]] || return 2
+  p_avail "$id"
+}
+
+is_on_provider() {
+  local id=${1:-}
+  [[ -n $id ]] || return 2
+  p_on "$id"
+}
+
+any_on() {
+  ensure_discovery
+  local id
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    p_on "$id" && return 0
+  done < <(all_ids)
+  return 1
+}
+
+# ---------- 入口 ----------
+cmd=${1:-panel}
+shift || true
+
+case "$cmd" in
+  panel)   panel_json ;;
+  bar)     bar_json ;;
+  status)  status_text ;;
+  list)    list_text ;;
+  on)
+    force=0; id=""
+    for arg in "$@"; do
+      case $arg in
+        --force) force=1 ;;
+        *) id=$arg ;;
+      esac
+    done
+    on_provider "$id" "$force" ;;
+  toggle)
+    id=${1:-}
+    [[ -n $id ]] || { echo "usage: vpn-switch toggle <id>" >&2; exit 2; }
+    if p_on "$id"; then off_provider "$id"; else on_provider "$id" 0; fi ;;
+  off)
+    off_provider "${1:-}" ;;
+  set)
+    set_vpn "${1:-}" ;;
+  cycle)   cycle ;;
+  refresh)
+    rm -f "$DISCOVERY_FILE" 2>/dev/null
+    ensure_discovery
+    notify "VPN" "已重新扫描：发现 $(jq 'length' "$DISCOVERY_FILE" 2>/dev/null || echo 0) 个本机 VPN / 代理" ;;
+  has)      has_provider "${1:-}" ;;
+  is-on)    is_on_provider "${1:-}" ;;
+  any-on)   any_on ;;
+  version|--version|-V) printf 'vpn-switch %s\n' "$VPN_SWITCH_VERSION" ;;
+  help|-h|--help)
+    sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  *)
+    echo "usage: vpn-switch [panel|bar|status|list|on <id> [--force]|toggle <id>|off [id]|set <id>|cycle|refresh|has <id>|is-on <id>|any-on]" >&2
+    exit 2 ;;
+esac

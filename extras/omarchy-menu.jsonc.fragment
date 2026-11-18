@@ -1,0 +1,107 @@
+  // Install with: ./install.sh --with-menu
+  // These rows call the vpn-switch CLI, so keep ~/.local/bin on PATH.
+  "vpn":            { "icon": "\udb81\udd62", "label": "VPN",
+                      "description": "同时开启互不冲突的 VPN / 代理；冲突组合会被阻止" },
+
+  "vpn.panel":      { "icon": "\udb81\udd62", "label": "打开 VPN 面板",
+                      "action": "omarchy-shell -q vpn toggle",
+                      "description": "列出自动发现的本机 VPN / 代理，逐个开关" },
+
+  "vpn.univpn":     { "icon": "\udb81\udd62", "label": "UniVPN 校内",
+                      "action": "vpn-switch toggle univpn",
+                      "when": "vpn-switch has univpn",
+                      "checked": "vpn-switch is-on univpn",
+                      "description": "联软 UniVPN · 默认路由隧道" },
+
+  "vpn.tailscale":  { "icon": "\udb81\udd62", "label": "Tailscale",
+                      "action": "vpn-switch toggle tailscale",
+                      "when": "vpn-switch has tailscale",
+                      "checked": "vpn-switch is-on tailscale",
+                      "description": "tailnet overlay，可与其它 VPN 共存" },
+
+  "vpn.flclash":    { "icon": "\udb81\udd62", "label": "FlClash",
+                      "action": "vpn-switch toggle flclash",
+                      "when": "vpn-switch has flclash",
+                      "checked": "vpn-switch is-on flclash",
+                      "description": "系统代理；开 TUN 时按隧道处理" },
+
+  "vpn.clashverge": { "icon": "\udb81\udd62", "label": "Clash Verge",
+                      "action": "vpn-switch toggle clash-verge",
+                      "when": "vpn-switch has clash-verge",
+                      "checked": "vpn-switch is-on clash-verge",
+                      "description": "系统代理 / TUN" },
+
+  "vpn.mihomo":     { "icon": "\udb81\udd62", "label": "Mihomo",
+                      "action": "vpn-switch toggle mihomo",
+                      "when": "vpn-switch has mihomo",
+                      "checked": "vpn-switch is-on mihomo",
+                      "description": "Mihomo / Clash Meta 内核" },
+
+  "vpn.singbox":    { "icon": "\udb81\udd62", "label": "sing-box",
+                      "action": "vpn-switch toggle sing-box",
+                      "when": "vpn-switch has sing-box",
+                      "checked": "vpn-switch is-on sing-box",
+                      "description": "sing-box 内核" },
+
+  "vpn.hiddify":    { "icon": "\udb81\udd62", "label": "Hiddify",
+                      "action": "vpn-switch toggle hiddify",
+                      "when": "vpn-switch has hiddify",
+                      "checked": "vpn-switch is-on hiddify",
+                      "description": "代理 / TUN" },
+
+  "vpn.nekoray":    { "icon": "\udb81\udd62", "label": "NekoRay / NekoBox",
+                      "action": "vpn-switch toggle nekoray",
+                      "when": "vpn-switch has nekoray",
+                      "checked": "vpn-switch is-on nekoray",
+                      "description": "代理 / TUN" },
+
+  "vpn.mullvad":    { "icon": "\udb81\udd62", "label": "Mullvad",
+                      "action": "vpn-switch toggle mullvad",
+                      "when": "vpn-switch has mullvad",
+                      "checked": "vpn-switch is-on mullvad",
+                      "description": "WireGuard 隧道" },
+
+  "vpn.nordvpn":    { "icon": "\udb81\udd62", "label": "NordVPN",
+                      "action": "vpn-switch toggle nordvpn",
+                      "when": "vpn-switch has nordvpn",
+                      "checked": "vpn-switch is-on nordvpn",
+                      "description": "VPN 隧道" },
+
+  "vpn.protonvpn":  { "icon": "\udb81\udd62", "label": "Proton VPN",
+                      "action": "vpn-switch toggle protonvpn",
+                      "when": "vpn-switch has protonvpn",
+                      "checked": "vpn-switch is-on protonvpn",
+                      "description": "VPN 隧道" },
+
+  "vpn.wireguard":  { "icon": "\udb81\udd62", "label": "WireGuard",
+                      "action": "vpn-switch toggle wireguard",
+                      "when": "vpn-switch has wireguard",
+                      "checked": "vpn-switch is-on wireguard",
+                      "description": "仅检测；连接需手动 wg-quick" },
+
+  "vpn.openvpn":    { "icon": "\udb81\udd62", "label": "OpenVPN",
+                      "action": "vpn-switch toggle openvpn",
+                      "when": "vpn-switch has openvpn",
+                      "checked": "vpn-switch is-on openvpn",
+                      "description": "仅检测；启动需配置文件" },
+
+  "vpn.openconnect": { "icon": "\udb81\udd62", "label": "OpenConnect",
+                      "action": "vpn-switch toggle openconnect",
+                      "when": "vpn-switch has openconnect",
+                      "checked": "vpn-switch is-on openconnect",
+                      "description": "仅检测；启动需配置文件" },
+
+  "vpn.v2raya":     { "icon": "\udb81\udd62", "label": "v2rayA",
+                      "action": "vpn-switch toggle v2raya",
+                      "when": "vpn-switch has v2raya",
+                      "checked": "vpn-switch is-on v2raya",
+                      "description": "仅检测；由 v2rayA 自身管理" },
+
+  "vpn.rescan":     { "icon": "\udb81\udc50", "label": "重新扫描本机 VPN",
+                      "action": "vpn-switch refresh",
+                      "description": "新安装的会自动加入，已卸载的会移除" },
+
+  "vpn.off":        { "icon": "\udb81\udd5f", "label": "全部断开",
+                      "action": "vpn-switch off",
+                      "when": "vpn-switch any-on",
+                      "description": "关闭所有正在运行的 VPN / 代理" }
