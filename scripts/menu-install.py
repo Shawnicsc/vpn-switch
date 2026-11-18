@@ -40,7 +40,11 @@ def insert_block(text: str, fragment: str) -> str:
     head = text[: opening + 1]
     rest = text[opening + 1 :]
     block = f"\n{BEGIN}\n{fragment.strip()}\n{END}\n"
-    if rest.strip().startswith("}") or rest.strip() == "":
+    # Only comments before the closing brace means the object has no keys, so a
+    # comma after our block would be a trailing comma. Strip line comments only
+    # for this emptiness check; the file itself is otherwise left untouched.
+    stripped = re.sub(r"(?m)^\s*//.*$", "", rest).strip()
+    if stripped in ("", "}") or stripped.startswith("}"):
         return head + block + rest.lstrip("\n")
     return head + block + ",\n" + rest.lstrip("\n")
 

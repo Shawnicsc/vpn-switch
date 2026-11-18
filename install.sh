@@ -85,8 +85,15 @@ run install -m 644 "$REPO_DIR/BarWidget.qml" "$BAR_MODULE"
 ensure_bar_entry() {
   local file=$SHELL_JSON tmp
   if [[ ! -f $file ]]; then
-    warn "$file not found; add {\"id\":\"vpn\",\"type\":\"qml\"} to bar.layout.right manually"
-    return 0
+    local default_shell="${OMARCHY_PATH:-/usr/share/omarchy}/config/omarchy/shell.json"
+    if [[ -f $default_shell ]]; then
+      run mkdir -p "$(dirname -- "$file")"
+      run cp -- "$default_shell" "$file"
+      say "created $file from Omarchy defaults"
+    else
+      warn "$file not found; add {\"id\":\"vpn\",\"type\":\"qml\"} to bar.layout.right manually"
+      return 0
+    fi
   fi
   if jq -e '[(.bar.layout // {}) | to_entries[] | .value[]? | select(.id? == "vpn")] | length > 0' \
       "$file" >/dev/null 2>&1; then
@@ -119,27 +126,38 @@ ensure_bar_entry
 
 if (( WITH_MENU )); then
   if [[ ! -f $MENU_JSONC ]]; then
-    warn "$MENU_JSONC not found; skipping menu integration"
-  elif ! command -v python3 >/dev/null 2>&1; then
-    warn "python3 not found; merge extras/omarchy-menu.jsonc.fragment manually"
-  elif grep -q '>>> vpn-switch menu' "$MENU_JSONC"; then
-    if (( DRY_RUN )); then
-      say "[dry-run] update vpn-switch block in $MENU_JSONC"
+    default_menu="${OMARCHY_PATH:-/usr/share/omarchy}/config/omarchy/extensions/omarchy-menu.jsonc"
+    if [[ -f $default_menu ]]; then
+      run mkdir -p "$(dirname -- "$MENU_JSONC")"
+      run cp -- "$default_menu" "$MENU_JSONC"
+      say "created $MENU_JSONC from Omarchy defaults"
     else
-      backup "$MENU_JSONC"
-      python3 "$REPO_DIR/scripts/menu-install.py" "$MENU_JSONC" "$REPO_DIR/extras/omarchy-menu.jsonc.fragment"
-      say "updated VPN menu rows in $MENU_JSONC"
+      warn "$MENU_JSONC not found; skipping menu integration"
     fi
-  elif grep -qE '^[[:space:]]*"vpn(\.[^"]+)?"[[:space:]]*:' "$MENU_JSONC"; then
-    warn "existing VPN keys found in $MENU_JSONC; not touching it."
-    warn "Merge extras/omarchy-menu.jsonc.fragment manually, or remove the old rows first."
-  else
-    if (( DRY_RUN )); then
-      say "[dry-run] add VPN rows to $MENU_JSONC"
+  fi
+
+  if [[ -f $MENU_JSONC ]]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+      warn "python3 not found; merge extras/omarchy-menu.jsonc.fragment manually"
+    elif grep -q '>>> vpn-switch menu' "$MENU_JSONC"; then
+      if (( DRY_RUN )); then
+        say "[dry-run] update vpn-switch block in $MENU_JSONC"
+      else
+        backup "$MENU_JSONC"
+        python3 "$REPO_DIR/scripts/menu-install.py" "$MENU_JSONC" "$REPO_DIR/extras/omarchy-menu.jsonc.fragment"
+        say "updated VPN menu rows in $MENU_JSONC"
+      fi
+    elif grep -qE '^[[:space:]]*"vpn(\.[^"]+)?"[[:space:]]*:' "$MENU_JSONC"; then
+      warn "existing VPN keys found in $MENU_JSONC; not touching it."
+      warn "Merge extras/omarchy-menu.jsonc.fragment manually, or remove the old rows first."
     else
-      backup "$MENU_JSONC"
-      python3 "$REPO_DIR/scripts/menu-install.py" "$MENU_JSONC" "$REPO_DIR/extras/omarchy-menu.jsonc.fragment"
-      say "added VPN rows to $MENU_JSONC"
+      if (( DRY_RUN )); then
+        say "[dry-run] add VPN rows to $MENU_JSONC"
+      else
+        backup "$MENU_JSONC"
+        python3 "$REPO_DIR/scripts/menu-install.py" "$MENU_JSONC" "$REPO_DIR/extras/omarchy-menu.jsonc.fragment"
+        say "added VPN rows to $MENU_JSONC"
+      fi
     fi
   fi
 fi

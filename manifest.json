@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.shawnicsc.vpn",
   "name": "VPN Switch",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Shawnicsc",
   "license": "MIT",
   "description": "Switch VPNs and proxies from the Omarchy bar. Non-conflicting providers can stay on together, and installed software is auto-discovered.",

@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-11-18
+
+### Fixed
+
+- The full installer now creates `shell.json` and the Omarchy menu extension
+  from Omarchy defaults when they do not exist yet.
+- Re-running `install.sh --with-menu` no longer leaves a duplicate comma or a
+  trailing comma in the menu JSONC (idempotent marker block).
+- ShellCheck warnings in the CLI were removed; CI runs the same checks.
+
 ## [1.0.0] - 2026-11-18
 
 ### Added
